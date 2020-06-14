@@ -66,6 +66,7 @@ func (g *Game) sendInitialGamestate() {
 	*g.Gamestate = stages.End
 
 	toExport := stages.Export()
+	logrus.Warningf("This should be null I guess?? %s", toExport.Players)
 
 	g.connection.SendMessage(message.NewStateMessage(toExport))
 }
@@ -92,11 +93,14 @@ func (g *Game) HandleActionMessage(msg message.ActionMessage) {
 	}
 
 	// Calculate the new gamestate
+	logrus.Debug("Process turn")
 	stages := g.Gamestate.ProcessTurn(g.pendingDeployActions, g.pendingMoveActions)
+	logrus.Debug("Reset actions")
 	g.resetActions()
 
 	*g.Gamestate = stages.End
 
+	logrus.Debug("Export gamestate")
 	toExport := stages.Export()
 
 	// Send response if necessary
@@ -104,6 +108,7 @@ func (g *Game) HandleActionMessage(msg message.ActionMessage) {
 	g.connection.SendMessage(message.NewStateMessage(toExport))
 
 	// Wait for all players
+	logrus.Debug("Reset waiting list")
 	g.resetWaitingList()
 }
 

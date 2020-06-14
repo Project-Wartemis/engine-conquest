@@ -4,16 +4,17 @@ import (
 	"github.com/Project-Wartemis/pw-engine/pkg/game/board"
 	"github.com/Project-Wartemis/pw-engine/pkg/game/events"
 	"github.com/Project-Wartemis/pw-engine/pkg/game/export"
+	"github.com/sirupsen/logrus"
 )
 
 type TurnStages struct {
-	Start        Gamestate            `json:"start"`
-	Travel       Gamestate            `json:"travel"`
-	End          Gamestate            `json:"end"`
-	DeployEvents []events.DeployEvent `json:"deployEvents"`
-	MoveEvents   []events.MoveEvent   `json:"moveEvent"`
-	BattleEvents []events.BattleEvent `json:"battleEvent"`
-	SiegeEvents  []events.SiegeEvent  `json:"siegeEvents"`
+	Start        Gamestate
+	Travel       Gamestate
+	End          Gamestate
+	DeployEvents []events.DeployEvent
+	MoveEvents   []events.MoveEvent
+	BattleEvents []events.BattleEvent
+	SiegeEvents  []events.SiegeEvent
 }
 
 func (stages *TurnStages) Export() export.Gamestate {
@@ -41,6 +42,8 @@ func (stages *TurnStages) Export() export.Gamestate {
 	result.Moves = moves
 	result.Fights = fights
 	result.Stages = nodeStages
+
+	logrus.Info(result.Players)
 
 	return result
 }
@@ -100,9 +103,9 @@ func (stages TurnStages) exportMoves() []export.Move {
 	moves := []export.Move{}
 	for _, mv := range stages.MoveEvents {
 		MV := export.Move{
-			Source: mv.MoveAction.SourceTileId,
-			Target: mv.MoveAction.TargetTileId,
-			Troops: mv.MoveAction.NumTroops,
+			Source: mv.Origin,
+			Target: mv.Destination,
+			Troops: mv.Troops,
 		}
 		moves = append(moves, MV)
 	}

@@ -1,6 +1,7 @@
 package game
 
 import (
+	"fmt"
 	"sort"
 
 	"github.com/Project-Wartemis/pw-engine/pkg/game/board"
@@ -17,54 +18,47 @@ func (gs *Gamestate) ProcessTurn(dpActions []events.DeployAction, mvActions []ev
 	logrus.Debug("New Turn!")
 	stages := TurnStages{}
 	stages.Start = *gs
-	// Validate deploy actions
-	// Validate move actions
-
-	// Convert deploy actions into events
-	deployEvents := ConvertDeployActionsToEvents(dpActions, &gs.Board)
 	// Make copy of board
 	newBoard := gs.Board
 
+	// Validate deploy actions
+
+	// Convert deploy actions into events
+	deployEvents := ConvertDeployActionsToEvents(dpActions, &gs.Board)
 	// Execute deploys
-	ExecuteDeploys(deployEvents, &newBoard)
+	executeDeploys(deployEvents, &newBoard)
 
 	// Validate move actions with new board
 
-	// Setup and execute moves
-	moveEvents := CreateMoveEventsFromActions(&mvActions, &newBoard)
-	logrus.Debugf("n moves: %d", len(moveEvents))
-	ExecuteMoveEvents(moveEvents, &newBoard)
+	// Muster armies
+	armies := musterArmies(mvActions, &newBoard)
 
-	// Setup and execute battles
-	battleEvents := CreateBattleEventsFromActions(&mvActions, &newBoard)
-	logrus.Debugf("n battles: %d", len(battleEvents))
-	executedBattleEvents, nonBattles := ExecuteBattles(battleEvents, &newBoard)
+	// Execute friendly movement
+	moveEvents := executeMoves(&armies, &newBoard)
+	// Execute battles
+	battleEvents := executeBattles(&armies, &newBoard)
 
-	// Save Travel gamestate
 	stages.Travel = Gamestate{
 		Board:   newBoard,
 		Players: gs.Players,
 	}
 
-	// Setup and execute sieges
-	siegeEvents := CreateSiegeEventsFromActions(&nonBattles, &newBoard)
-	logrus.Debugf("n sieges: %d", len(siegeEvents))
-	siegeEvents = ExecuteSieges(siegeEvents, &newBoard)
+	// Execute sieges
+	siegeEvents := ExecuteSieges(&armies, &newBoard)
+
+	// Setup moves,battles and sieges
+	logrus.Debugf("n moves:   %d", len(moveEvents))
+	logrus.Debugf("n battles: %d", len(battleEvents))
+	logrus.Debugf("n sieges:  %d", len(siegeEvents))
 
 	// Check which players are still active
-	activePlayerSet := make(map[int]struct{})
-	for _, tile := range newBoard.Tiles {
-		activePlayerSet[tile.Owner] = struct{}{}
-	}
-	newPlayers := gs.Players
-	for i, p := range newPlayers {
-		_, ok := activePlayerSet[p.Name]
-		newPlayers[i].Active = ok
-	}
+	newPlayers := checkActivePlayers(gs.Players, newBoard)
+	// Calculate player income
+	gs.Players = calculatePlayerIncome(gs.Players, newBoard)
 
 	stages.DeployEvents = deployEvents
 	stages.MoveEvents = moveEvents
-	stages.BattleEvents = executedBattleEvents
+	stages.BattleEvents = battleEvents
 	stages.SiegeEvents = siegeEvents
 	stages.End = Gamestate{
 		Board:   newBoard,
@@ -79,82 +73,220 @@ func (gs *Gamestate) ProcessTurn(dpActions []events.DeployAction, mvActions []ev
 	return stages
 }
 
-func ExecuteDeploys(dps []events.DeployEvent, brd *board.Board) {
+func checkActivePlayers(players []Player, brd board.Board) []Player {
+	activePlayerSet := make(map[int]struct{})
+	for _, tile := range brd.Tiles {
+		activePlayerSet[tile.Owner] = struct{}{}
+	}
+	newPlayers := players
+	for i, p := range newPlayers {
+		_, ok := activePlayerSet[p.Name]
+		newPlayers[i].Active = ok
+	}
+	return newPlayers
+}
+
+func calculatePlayerIncome(players []Player, brd board.Board) []Player {
+	playerIdMap := map[int]*Player{}
+	for i, p := range players {
+		players[i].ArmiesToDeploy = 5
+		playerIdMap[p.Name] = &players[i]
+	}
+	for _, tile := range brd.Tiles {
+		if tile.Owner < 0 {
+			continue // Owned by neutral player
+		}
+		playerIdMap[tile.Owner].ArmiesToDeploy += 1
+	}
+	return players
+}
+
+func executeDeploys(dps []events.DeployEvent, brd *board.Board) {
 	for _, de := range dps {
 		logrus.Debugf("Player [%d] deploys [%d] troops to [%d]", de.Player, de.After.NumTroops-de.Before.NumTroops, de.TileId)
 		brd.Tiles[de.TileId].Garrison = de.After.NumTroops
 	}
 }
 
-func ExecuteMoveEvents(mvs []events.MoveEvent, brd *board.Board) {
-	for _, mv := range mvs {
-		sourceTile := mv.MoveAction.SourceTileId
-		targetTile := mv.MoveAction.TargetTileId
-		numTroops := mv.MoveAction.NumTroops
-		logrus.Debugf("Player [%d] moves [%d] troops from [%d] to [%d]", mv.MoveAction.Player, numTroops, sourceTile, targetTile)
-		brd.Tiles[sourceTile].Garrison -= numTroops
-		brd.Tiles[targetTile].Garrison += numTroops
+func musterArmies(mvActions []events.MoveAction, brd *board.Board) []events.Army {
+	armies := []events.Army{}
+	for _, mv := range mvActions {
+		// Create the army
+		army := events.Army{
+			Player:      mv.Player,
+			Troops:      mv.NumTroops,
+			Destination: mv.TargetTileId,
+			Origin:      mv.SourceTileId,
+		}
+		armies = append(armies, army)
+		// Remove troops from tile
+		brd.Tiles[mv.SourceTileId].Garrison -= mv.NumTroops
+		if brd.Tiles[mv.SourceTileId].Garrison < 0 {
+			logrus.Fatalf("Number of troops in tile [%d] is negative: [%d]", mv.SourceTileId, brd.Tiles[mv.SourceTileId].Garrison)
+		}
 	}
+	return armies
 }
 
-func ExecuteBattles(battles []events.BattleEvent, brd *board.Board) ([]events.BattleEvent, []events.BattleEvent) {
-	for i, battle := range battles {
-		battles[i] = ExecuteBattle(battle, brd)
+func executeMoves(armies *[]events.Army, brd *board.Board) []events.MoveEvent {
+	moveEvents := []events.MoveEvent{}
+	for i := len(*armies) - 1; i >= 0; i-- {
+		sourceTile := (*armies)[i].Origin
+		targetTile := (*armies)[i].Destination
+		// Check if owner is the same
+		if brd.Tiles[sourceTile].Owner != brd.Tiles[targetTile].Owner {
+			// This is a battle or siege
+			continue
+		}
+		// Make the move on the board
+		nTroops := (*armies)[i].Troops
+		// if brd.Tiles[sourceTile].Garrison < 0 {
+		// 	logrus.Fatalf("Number of troops in tile [%d] is negative: [%d]", sourceTile, brd.Tiles[sourceTile].Garrison)
+		// }
+		// brd.Tiles[sourceTile].Garrison -= nTroops
+		brd.Tiles[targetTile].Garrison += nTroops
+
+		logrus.Debugf("Player [%d] moves [%d] troops from [%d] to [%d]", (*armies)[i].Player, nTroops, sourceTile, targetTile)
+		// Convert this army to a MoveEvent
+		newMoveEvent := events.MoveEvent{(*armies)[i]}
+		moveEvents = append(moveEvents, newMoveEvent)
+		// Remove this armies from the army list
+		*armies = append((*armies)[:i], (*armies)[i+1:]...)
 	}
-	return battles, battles // UPDATE THIS
+	return moveEvents
 }
-func ExecuteSieges(sieges []events.SiegeEvent, brd *board.Board) []events.SiegeEvent {
-	for i, siege := range sieges {
-		sieges[i] = ExecuteSiege(siege, brd)
+
+func executeBattles(armies *[]events.Army, brd *board.Board) []events.BattleEvent {
+	// Group armies per link
+	group := map[string][]int{}
+	for i, army := range *armies {
+		a, b := sortInts(army.Origin, army.Destination)
+		key := fmt.Sprintf("%d-%d", a, b)
+		if _, ok := group[key]; ok {
+			group[key] = append(group[key], i)
+		} else {
+			group[key] = []int{i}
+		}
 	}
+	// Record all indices of armies to delete
+	armiesToDelete := []int{}
+	battles := []events.BattleEvent{}
+	for _, armyIndices := range group {
+		if len(armyIndices) == 1 {
+			// This will be a siege army
+			continue
+		}
+		// Get participating armies from the list
+		participatingArmies := []events.Army{}
+		for _, i := range armyIndices {
+			participatingArmies = append(participatingArmies, (*armies)[i])
+			armiesToDelete = append(armiesToDelete, i)
+		}
+
+		battleEvent := GenerateBattleEventFromArmies(participatingArmies, brd)
+		battles = append(battles, battleEvent)
+		*armies = append(*armies, battleEvent.VictoriousArmy)
+	}
+
+	// Sort armies to delete descending
+	sort.Slice(armiesToDelete, func(i, j int) bool { return i > j })
+	// Remove them
+	for _, indexToDelete := range armiesToDelete {
+		*armies = append((*armies)[:indexToDelete], (*armies)[indexToDelete+1:]...)
+	}
+
+	return battles
+}
+
+func GenerateBattleEventFromArmies(armies []events.Army, brd *board.Board) events.BattleEvent {
+	// Find tile ID
+	tileId := GetLinkId(armies[0].Destination, armies[0].Origin, brd)
+
+	// Sort armies by descending number of troops
+	sort.Slice(armies, func(i, j int) bool { return armies[i].Troops > armies[j].Troops })
+
+	// Create victorious army
+	victoriousArmy := events.Army{
+		Player:      armies[0].Player,
+		Troops:      armies[0].Troops - armies[1].Troops,
+		Destination: armies[0].Destination,
+		Origin:      armies[0].Origin,
+	}
+
+	// Create battle event
+	battleEvent := events.BattleEvent{
+		Location:       tileId,
+		Armies:         armies,
+		VictoriousArmy: victoriousArmy,
+	}
+
+	return battleEvent
+}
+
+func ExecuteSieges(armies *[]events.Army, brd *board.Board) []events.SiegeEvent {
+	sieges := []events.SiegeEvent{}
+
+	siegedTiles := map[int][]events.Army{}
+
+	for _, army := range *armies {
+		if _, ok := siegedTiles[army.Destination]; ok {
+			siegedTiles[army.Destination] = append(siegedTiles[army.Destination], army)
+		} else {
+			siegedTiles[army.Destination] = []events.Army{army}
+		}
+	}
+
+	for _, participatingArmies := range siegedTiles {
+		siegeEvent := ExecuteSiege(participatingArmies, brd)
+		sieges = append(sieges, siegeEvent)
+	}
+
 	return sieges
 }
 
-func ExecuteBattle(battle events.BattleEvent, brd *board.Board) events.BattleEvent {
-	sort.Slice(battle.Armies, func(i, j int) bool { return battle.Armies[i].Troops < battle.Armies[j].Troops })
-	numTroopsLeft := battle.Armies[len(battle.Armies)-1].Troops - battle.Armies[len(battle.Armies)-2].Troops
+func ExecuteSiege(armies []events.Army, brd *board.Board) events.SiegeEvent {
+	tileId := armies[0].Destination
+	besiegedPlayer := brd.Tiles[tileId].Owner
+	logrus.Infof("Player [%d] is begin besieged on Tile [%d] with [%d] armies",
+		besiegedPlayer, tileId, len(armies))
 
-	battle.VictoriousArmy = battle.Armies[len(battle.Armies)-1]
-	battle.VictoriousArmy.Troops = numTroopsLeft
-
-	// Update the board
-	logrus.Infof("Battle at link [%d] between [%d] armies", battle.Location, len(battle.Armies))
-	for _, army := range battle.Armies {
-		brd.Tiles[army.Origin].Garrison -= army.Troops
-		logrus.Infof("Player [%d] controls [%d] troops from [%d] with destination [%d]", army.Player, army.Troops, army.Origin, army.Destination)
+	// Create army for defenders
+	defendingArmy := events.Army{
+		Player:      besiegedPlayer,
+		Troops:      brd.Tiles[tileId].Garrison,
+		Destination: tileId,
+		Origin:      tileId,
 	}
-	logrus.Infof("Battle won by player [%d]. [%d] troops left, moving to [%d]",
-		battle.VictoriousArmy.Player,
-		battle.VictoriousArmy.Troops,
-		battle.VictoriousArmy.Destination)
+	brd.Tiles[tileId].Garrison = 0
+	armies = append(armies, defendingArmy)
 
-	return battle
-}
-
-func ExecuteSiege(siege events.SiegeEvent, brd *board.Board) events.SiegeEvent {
 	// Sort armies by DESCENDING num troops
-	sort.Slice(siege.Armies, func(i, j int) bool { return siege.Armies[i].Troops > siege.Armies[j].Troops })
-	logrus.Infof("Siege at tile [%d] with [%d] armies", siege.Location, len(siege.Armies))
-	// Remove troops from origins
-	for _, army := range siege.Armies {
-		brd.Tiles[army.Origin].Garrison -= army.Troops
+	sort.Slice(armies, func(i, j int) bool { return armies[i].Troops > armies[j].Troops })
+
+	for _, army := range armies {
 		logrus.Infof("Player [%d] controls [%d] troops from [%d]", army.Player, army.Troops, army.Origin)
 	}
 
 	// Number of troops left for winning army
-	numTroopsLeft := siege.Armies[0].Troops - siege.Armies[1].Troops
-	victoriousPlayer := siege.Armies[0].Player
+	numTroopsLeft := armies[0].Troops - armies[1].Troops
 
-	brd.Tiles[siege.Location].Garrison = numTroopsLeft
-	brd.Tiles[siege.Location].Owner = victoriousPlayer
+	// It's a draw. Does does not change owner
+	victoriousPlayer := besiegedPlayer
+	if numTroopsLeft > 0 {
+		victoriousPlayer = armies[0].Player
+	}
+
+	brd.Tiles[tileId].Garrison = numTroopsLeft
+	brd.Tiles[tileId].Owner = victoriousPlayer
 
 	// Update siege
+	siege := events.SiegeEvent{}
+	siege.Armies = armies
+	siege.Location = tileId
 	siege.PostSiegeState.NumTroops = numTroopsLeft
 	siege.PostSiegeState.Owner = victoriousPlayer
 
-	logrus.Infof("Siege won by player [%d] with [%d] left from tile [%d]", victoriousPlayer, numTroopsLeft, siege.Armies[0].Origin)
-	logrus.Infof("Owner of siege location: [%d]", brd.Tiles[siege.Location].Owner)
-	logrus.Infof("Number of troops in siege location: [%d]", brd.Tiles[siege.Location].Garrison)
+	logrus.Infof("Siege won by player [%d] with [%d] left", victoriousPlayer, numTroopsLeft)
 
 	return siege
 }

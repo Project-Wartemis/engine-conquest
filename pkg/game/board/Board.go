@@ -53,14 +53,23 @@ func NewEmptyBoard(numTiles int, connections []Connection) *Board {
 }
 
 func LoadExampleBoard(players []int) *Board {
-	b := NewEmptyBoard(5, []Connection{
+	b := NewEmptyBoard(6, []Connection{
 		{0, 1},
-		{0, 2},
-		{0, 4},
 		{1, 2},
 		{2, 3},
 		{3, 4},
+		{4, 5},
 	})
+	if len(players) == 1 {
+		b.Tiles[2].Owner = players[0]
+		return b
+	}
+	if len(players) == 2 {
+		b.Tiles[0].Owner = players[0]
+		b.Tiles[4].Owner = players[1]
+		return b
+	}
+
 	for i, p := range players {
 		b.Tiles[i].Owner = p
 	}
